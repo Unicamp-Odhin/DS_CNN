@@ -1,0 +1,16 @@
+# Ignore object files
+*.o
+*.obj
+
+# Ignore binary executables
+*.exe
+*.out
+*.bin
+*.elf
+
+# Ignore shared and static libraries
+*.so
+*.dll
+*.dylib
+*.a
+*.lib

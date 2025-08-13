@@ -1,7 +1,5 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <stdint.h>
-#include <math.h>
 #include "model.h"  // Contains Q15 weights and biases as int16_t arrays
 
 #define N_FRAMES 399
@@ -15,18 +13,6 @@ void relu_q15(int16_t* data, int size) {
     }
 }
 
-// Fully connected: input length = in_dim, produces one Q15 output
-int16_t fully_connected_q15(const int16_t* input, const int16_t* weights,
-                            int32_t bias, int in_dim) {
-    int32_t acc = bias;
-    for (int i = 0; i < in_dim; ++i) {
-        acc += ((int32_t)input[i] * weights[i]) >> 15;
-    }
-    if (acc > 32767) acc = 32767;
-    if (acc < -32768) acc = -32768;
-    return (int16_t)acc;
-}
-
 // Sigmoid approximation in Q15
 int16_t sigmoid_q15(int16_t x) {
     if (x < -16384) return 0;
@@ -37,45 +23,63 @@ int16_t sigmoid_q15(int16_t x) {
     return (int16_t)y;
 }
 
-// Depthwise convolution per channel
+// Generic dot product for Q15 vectors
+int16_t generic_product_q15(const int16_t* vec_a, const int16_t* vec_b, int length, int32_t bias) {
+    int32_t acc = bias;
+    for (int i = 0; i < length; ++i) {
+        acc += ((int32_t)vec_a[i] * vec_b[i]) >> 15;
+    }
+    if (acc > 32767) acc = 32767;
+    if (acc < -32768) acc = -32768;
+    return (int16_t)acc;
+}
+
+// Depthwise convolution per channel usando im2col
 void depthwise_conv_q15(const int16_t* input, int16_t* output,
                         int H, int W,
                         const int16_t* kernel, int32_t bias) {
+    // im2col buffer for a 3x3 patch
+    int16_t col[KERNEL_SZ * KERNEL_SZ];
     for (int i = 0; i < H; ++i) {
         for (int j = 0; j < W; ++j) {
-            int32_t acc = bias;
+            // Fill the im2col buffer
+            int idx = 0;
             for (int ki = 0; ki < KERNEL_SZ; ++ki) {
                 int ii = i + ki - 1;
-                if (ii < 0 || ii >= H) continue;
                 for (int kj = 0; kj < KERNEL_SZ; ++kj) {
                     int jj = j + kj - 1;
-                    if (jj < 0 || jj >= W) continue;
-                    int16_t v = input[ii * W + jj];
-                    int16_t w = kernel[ki * KERNEL_SZ + kj];
-                    acc += ((int32_t)v * w) >> 15;
+                    if (ii < 0 || ii >= H || jj < 0 || jj >= W)
+                        col[idx++] = 0;
+                    else
+                        col[idx++] = input[ii * W + jj];
                 }
             }
-            if (acc > 32767) acc = 32767;
-            if (acc < -32768) acc = -32768;
-            output[i * W + j] = (int16_t)acc;
+            // Scalar product kernel x patch
+            int16_t acc = generic_product_q15(col, kernel, KERNEL_SZ * KERNEL_SZ, bias);
+            output[i * W + j] = acc;
         }
     }
 }
 
-// Pointwise 1x1 conv: Cin -> Cout
+
+// Pointwise 1x1 conv: Cin -> Cout usando im2col
 void pointwise_conv_q15(const int16_t* input, int16_t* output,
                         int Cin, int Cout, int H, int W,
                         const int16_t* weights, const int32_t* biases) {
     int spatial = H * W;
-    for (int co = 0; co < Cout; ++co) {
-        for (int idx = 0; idx < spatial; ++idx) {
-            int32_t acc = biases[co];
-            for (int ci = 0; ci < Cin; ++ci) {
-                acc += ((int32_t)input[ci * spatial + idx] * weights[co * Cin + ci]) >> 15;
-            }
-            if (acc > 32767) acc = 32767;
-            if (acc < -32768) acc = -32768;
-            output[co * spatial + idx] = (int16_t)acc;
+    // im2col: each column is a vector of Cin entries (one pixel across all channels)
+    // input: [Cin][spatial]
+    // output: [Cout][spatial]
+    for (int idx = 0; idx < spatial; ++idx) {
+        // Create the column vector for this pixel
+        int16_t col[Cin];
+        for (int ci = 0; ci < Cin; ++ci) {
+            col[ci] = input[ci * spatial + idx];
+        }
+        // For each output, compute the dot product
+        for (int co = 0; co < Cout; ++co) {
+            int16_t acc = generic_product_q15(col, weights + co * Cin, Cin, biases[co]);
+            output[co * spatial + idx] = acc;
         }
     }
 }
@@ -152,8 +156,8 @@ float predict_keyword(const float mfcc_float[N_FRAMES][N_CEPS]) {
 
     // 6) Fully Connected -> logit
     int32_t custom_bias = net_6_bias[0] + 28000;
-    int16_t logit_q15 = fully_connected_q15(
-        pool_out, net_6_weight, custom_bias, 64
+    int16_t logit_q15 = generic_product_q15(
+        pool_out, net_6_weight, 64, custom_bias
     );
     printf("LOGIT_Q15 = %d\n", logit_q15);
 
@@ -181,7 +185,7 @@ int main(int argc, char** argv) {
 
     float prob = predict_keyword(mfcc);
     printf("Prediction probability: %.4f\n", prob);
-    if (prob > 0.4495f)
+    if (prob > 0.4995f)
         printf("Keyword DETECTED\n");
     else
         printf("Background (no keyword)\n");
