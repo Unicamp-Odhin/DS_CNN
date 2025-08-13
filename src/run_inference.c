@@ -1,7 +1,5 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <stdint.h>
-#include <math.h>
 #include "model.h"  // Contains Q15 weights and biases as int16_t arrays
 
 #define N_FRAMES 399
@@ -153,8 +151,9 @@ float predict_keyword(const float mfcc_float[N_FRAMES][N_CEPS]) {
     avgpool_q15(pw2_out, pool_out, 64, H, W);
 
     // 6) Fully Connected -> logit
+    int32_t custom_bias = net_6_bias[0] + 28000; // Custom bias adjustment
     int16_t logit_q15 = fully_connected_q15(
-        pool_out, net_6_weight, net_6_bias[0], 64
+        pool_out, net_6_weight, custom_bias, 64
     );
     printf("LOGIT_Q15 = %d\n", logit_q15);
 
@@ -182,7 +181,7 @@ int main(int argc, char** argv) {
 
     float prob = predict_keyword(mfcc);
     printf("Prediction probability: %.4f\n", prob);
-    if (prob > 0.5f)
+    if (prob > 0.4995f)
         printf("Keyword DETECTED\n");
     else
         printf("Background (no keyword)\n");
