@@ -55,8 +55,8 @@ void depthwise_conv_q15(const int16_t* input, int16_t* output,
                 }
             }
             // Scalar product kernel x patch
-            int32_t acc = generic_product_q15(col, kernel, KERNEL_SZ * KERNEL_SZ, bias);
-            output[i * W + j] = (int16_t)acc;
+            int16_t acc = generic_product_q15(col, kernel, KERNEL_SZ * KERNEL_SZ, bias);
+            output[i * W + j] = acc;
         }
     }
 }
@@ -78,8 +78,8 @@ void pointwise_conv_q15(const int16_t* input, int16_t* output,
         }
         // For each output, compute the dot product
         for (int co = 0; co < Cout; ++co) {
-            int32_t acc = generic_product_q15(col, weights + co * Cin, Cin, biases[co]);
-            output[co * spatial + idx] = (int16_t)acc;
+            int16_t acc = generic_product_q15(col, weights + co * Cin, Cin, biases[co]);
+            output[co * spatial + idx] = acc;
         }
     }
 }
