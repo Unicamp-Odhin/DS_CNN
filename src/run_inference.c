@@ -37,45 +37,59 @@ int16_t sigmoid_q15(int16_t x) {
     return (int16_t)y;
 }
 
-// Depthwise convolution per channel
-void depthwise_conv_q15(const int16_t* input, int16_t* output,
-                        int H, int W,
-                        const int16_t* kernel, int32_t bias) {
-    for (int i = 0; i < H; ++i) {
-        for (int j = 0; j < W; ++j) {
-            int32_t acc = bias;
-            for (int ki = 0; ki < KERNEL_SZ; ++ki) {
-                int ii = i + ki - 1;
-                if (ii < 0 || ii >= H) continue;
-                for (int kj = 0; kj < KERNEL_SZ; ++kj) {
-                    int jj = j + kj - 1;
-                    if (jj < 0 || jj >= W) continue;
-                    int16_t v = input[ii * W + jj];
-                    int16_t w = kernel[ki * KERNEL_SZ + kj];
-                    acc += ((int32_t)v * w) >> 15;
-                }
-            }
-            if (acc > 32767) acc = 32767;
-            if (acc < -32768) acc = -32768;
-            output[i * W + j] = (int16_t)acc;
-        }
-    }
-}
-
-// Pointwise 1x1 conv: Cin -> Cout
-void pointwise_conv_q15(const int16_t* input, int16_t* output,
-                        int Cin, int Cout, int H, int W,
-                        const int16_t* weights, const int32_t* biases) {
+// Generic 2D convolution that handles both depthwise and pointwise cases
+void conv2d_q15(const int16_t* input, int16_t* output,
+               int Cin, int Cout, int H, int W,
+               const int16_t* weights, const int32_t* biases,
+               int kernel_size) {
     int spatial = H * W;
+    int groups = (Cout == Cin && kernel_size > 1) ? Cin : 1; // depthwise if Cout==Cin and kernel>1
+    int filters_per_group = Cout / groups;
+    
+    // For each output channel
     for (int co = 0; co < Cout; ++co) {
-        for (int idx = 0; idx < spatial; ++idx) {
-            int32_t acc = biases[co];
-            for (int ci = 0; ci < Cin; ++ci) {
-                acc += ((int32_t)input[ci * spatial + idx] * weights[co * Cin + ci]) >> 15;
+        // Determine which input channels to use for this output channel
+        int group_idx = co / filters_per_group;
+        int cin_start = group_idx * (Cin / groups);
+        int cin_end = cin_start + (Cin / groups);
+        
+        // For each spatial location in the output
+        for (int i = 0; i < H; ++i) {
+            for (int j = 0; j < W; ++j) {
+                int32_t acc = biases[co];
+                
+                // For each input channel in this group
+                for (int ci = cin_start; ci < cin_end; ++ci) {
+                    // For each kernel position
+                    for (int ki = 0; ki < kernel_size; ++ki) {
+                        int ii = i + ki - (kernel_size > 1 ? 1 : 0);
+                        if (ii < 0 || ii >= H) continue;
+                        
+                        for (int kj = 0; kj < kernel_size; ++kj) {
+                            int jj = j + kj - (kernel_size > 1 ? 1 : 0);
+                            if (jj < 0 || jj >= W) continue;
+                            
+                            // Calculate input and weight indices
+                            int in_idx = ci * spatial + ii * W + jj;
+                            int w_idx;
+                            if (kernel_size > 1) {
+                                // Depthwise: each output channel uses its own kernel
+                                w_idx = co * kernel_size * kernel_size + ki * kernel_size + kj;
+                            } else {
+                                // Pointwise: weights are arranged as [Cout][Cin]
+                                w_idx = co * Cin + ci;
+                            }
+                            
+                            acc += ((int32_t)input[in_idx] * weights[w_idx]) >> 15;
+                        }
+                    }
+                }
+                
+                // Clamp and store result
+                if (acc > 32767) acc = 32767;
+                if (acc < -32768) acc = -32768;
+                output[co * spatial + i * W + j] = (int16_t)acc;
             }
-            if (acc > 32767) acc = 32767;
-            if (acc < -32768) acc = -32768;
-            output[co * spatial + idx] = (int16_t)acc;
         }
     }
 }
@@ -107,43 +121,31 @@ float predict_keyword(const float mfcc_float[N_FRAMES][N_CEPS]) {
     static int16_t conv_out[32 * N_FRAMES * N_CEPS];
     for (int oc = 0; oc < 32; ++oc) {
         const int16_t* ker = net_0_weight + oc * 1 * KERNEL_SZ * KERNEL_SZ;
-        int32_t bias = net_0_bias[oc];
-        depthwise_conv_q15(in_q15, &conv_out[oc * H * W], H, W, ker, bias);
+        int32_t bias_arr = net_0_bias[oc];
+        conv2d_q15(in_q15, &conv_out[oc * H * W], 1, 1, H, W, ker, &bias_arr, KERNEL_SZ);
     }
     relu_q15(conv_out, 32 * H * W);
 
     // 3) DS Block1: Depthwise (32->32)
     static int16_t dw1_out[32 * N_FRAMES * N_CEPS];
-    for (int c = 0; c < 32; ++c) {
-        depthwise_conv_q15(
-            &conv_out[c * H * W], &dw1_out[c * H * W], H, W,
-            net_2_block_0_weight + c * KERNEL_SZ * KERNEL_SZ,
-            net_2_block_0_bias[c]
-        );
-    }
+    conv2d_q15(conv_out, dw1_out, 32, 32, H, W,
+               net_2_block_0_weight, net_2_block_0_bias, KERNEL_SZ);
+    
     // Pointwise (32->64)
     static int16_t pw1_out[64 * N_FRAMES * N_CEPS];
-    pointwise_conv_q15(
-        dw1_out, pw1_out, 32, 64, H, W,
-        net_2_block_1_weight, net_2_block_1_bias
-    );
+    conv2d_q15(dw1_out, pw1_out, 32, 64, H, W,
+               net_2_block_1_weight, net_2_block_1_bias, 1);
     relu_q15(pw1_out, 64 * H * W);
 
     // 4) DS Block2: Depthwise (64->64)
     static int16_t dw2_out[64 * N_FRAMES * N_CEPS];
-    for (int c = 0; c < 64; ++c) {
-        depthwise_conv_q15(
-            &pw1_out[c * H * W], &dw2_out[c * H * W], H, W,
-            net_3_block_0_weight + c * KERNEL_SZ * KERNEL_SZ,
-            net_3_block_0_bias[c]
-        );
-    }
+    conv2d_q15(pw1_out, dw2_out, 64, 64, H, W,
+               net_3_block_0_weight, net_3_block_0_bias, KERNEL_SZ);
+    
     // Pointwise (64->64)
     static int16_t pw2_out[64 * N_FRAMES * N_CEPS];
-    pointwise_conv_q15(
-        dw2_out, pw2_out, 64, 64, H, W,
-        net_3_block_1_weight, net_3_block_1_bias
-    );
+    conv2d_q15(dw2_out, pw2_out, 64, 64, H, W,
+               net_3_block_1_weight, net_3_block_1_bias, 1);
     relu_q15(pw2_out, 64 * H * W);
 
     // 5) Pooling
